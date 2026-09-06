@@ -45,9 +45,6 @@ const normDate=v=>{
   }
   const s=clean(v).trim();
 
-  // Excel puede devolver las fechas como "18/08/2026", "18/08/2026 00:00:00"
-  // o como "2026-08-18 00:00:00". Normalizamos todos esos formatos a YYYY-MM-DD
-  // para que el cálculo de días laborables y, por tanto, la capacidad no quede en 0.
   let m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})(?:\s|T|$)/);
   if(m)return `${m[3]}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
 
@@ -76,7 +73,7 @@ const numVal=v=>{
   if(v==null||v==='')return 0;
   if(typeof v==='number')return Number.isFinite(v)?v:0;
   let s=clean(v).replace(/[$\s]/g,'');
-  // Soporta 4.5, 4,5, 1.234,56 y 1,234.56
+
   if(s.includes(',')&&s.includes('.')){
     if(s.lastIndexOf(',')>s.lastIndexOf('.')) s=s.replace(/\./g,'').replace(',','.');
     else s=s.replace(/,/g,'');
@@ -142,7 +139,7 @@ function App(){
      setTimeout(()=>setNotice(''),4500);
    }catch(e){setNotice(`No se pudo calcular el Excel: ${e.message||'formato no reconocido'}`)}
  }
- const nav=[['Resumen',LayoutDashboard],['KPIs Ingeniería',Target],['Proyectos',FolderKanban],['Clientes',Users],['Servicios',Server],['Bolsa de horas',Clock3],['Mesa de ayuda',LifeBuoy],['Bitácora',Activity]];
+ const nav=[['Resumen',LayoutDashboard],['KPIs Ingeniería',Target],['Proyectos',FolderKanban],['Servicios',Server],['Bolsa de horas',Clock3],['Mesa de ayuda',LifeBuoy],['Bitácora',Activity]];
  return <div className="app"><aside><div className="brand"><div className="logo">C</div><div><b>CORE IP</b><span>Centro de control</span></div></div><nav>{nav.map(([n,I])=><button key={n} className={tab===n?'active':''} onClick={()=>setTab(n)}><I size={17}/>{n}</button>)}</nav><div className="source"><Database size={17}/><div><b>Fuentes conectadas</b><span>{sheets.length} hojas comerciales · {activities.length} actividades</span></div></div></aside>
  <main><header><div><p className="eyebrow">CENTRO DE OPERACIONES · CORE IP</p><h1>{tab}</h1><p className="sub">Una sola vista para operación, proyectos, clientes, servicios y desempeño de ingeniería.</p></div><div className="uploads"><label className="upload"><Upload size={16}/> Bitácora comercial<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'business')}/></label><label className="upload secondary"><Upload size={16}/> Seguimiento KPI<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'activities')}/></label></div></header>{notice&&<div className="toast"><CheckCircle2 size={17}/>{notice}</div>}
  {tab==='Resumen'&&<Executive totals={totals} kpi={engKpis} clients={clientRows} serviceRows={serviceRows} personData={personData} statusData={statusData} trendData={trendData} setTab={setTab}/>} 
