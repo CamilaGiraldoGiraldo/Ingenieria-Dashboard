@@ -148,7 +148,7 @@ function App(){
  {tab==='Resumen'&&<Executive totals={totals} kpi={engKpis} clients={clientRows} serviceRows={serviceRows} personData={personData} statusData={statusData} trendData={trendData} setTab={setTab}/>} 
  {tab==='KPIs Ingeniería'&&<KPIDashboard kpi={engKpis} personData={personData} statusData={statusData} trendData={trendData} filters={filters} setFilters={setFilters} start={start} end={end} population={population} activities={activities}/>} 
  {tab==='Proyectos'&&<Projects rows={projectRows} clients={uniq(projectRows.map(x=>x.cliente))} filters={filters} setFilters={setFilters}/>} 
- {tab==='Clientes'&&<Clients data={clientRows}/>} {tab==='Servicios'&&<Services data={serviceRows}/>} {tab==='Bolsa de horas'&&<Bolsa data={bolsaRows}/>} {tab==='Mesa de ayuda'&&<Help data={helpRows}/>} {tab==='Bitácora'&&<Bitacora rows={filteredActivities} filters={filters} setFilters={setFilters} start={start} end={end} population={population}/>} 
+ {tab==='Servicios'&&<Services data={serviceRows}/>} {tab==='Bolsa de horas'&&<Bolsa data={bolsaRows}/>} {tab==='Mesa de ayuda'&&<Help data={helpRows}/>} {tab==='Bitácora'&&<Bitacora rows={filteredActivities} filters={filters} setFilters={setFilters} start={start} end={end} population={population}/>} 
  </main></div>
 }
 function KPI({icon:I,label,value,detail,tone='blue'}){return <div className="kpi"><div className="kpiTop"><span>{label}</span><span className={'ico '+tone}><I size={17}/></span></div><strong>{value}</strong><small>{detail}</small></div>}
