@@ -1,4 +1,4 @@
-import React,{useMemo,useState} from 'react';
+import React,{useEffect,useMemo,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import * as XLSX from 'xlsx';
 import {BarChart,Bar,XAxis,YAxis,Tooltip,ResponsiveContainer,PieChart,Pie,Cell,LineChart,Line,CartesianGrid,Legend,AreaChart,Area} from 'recharts';
@@ -45,11 +45,23 @@ const normDate=v=>{
   }
   const s=clean(v).trim();
 
+  // Excel puede devolver las fechas como "18/08/2026", "18/08/2026 00:00:00"
+  // o como "2026-08-18 00:00:00". Normalizamos todos esos formatos a YYYY-MM-DD
+  // para que el cálculo de días laborables y, por tanto, la capacidad no quede en 0.
   let m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})(?:\s|T|$)/);
   if(m)return `${m[3]}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
 
   m=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:\s|T|$)/);
   if(m)return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+
+  // Algunos archivos exportan la fecha con año de 2 dígitos (ej. "8/18/26" para
+  // celdas con formato mm-dd-yy). En ese caso el orden es Mes/Día/Año.
+  m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})(?:\s|T|$)/);
+  if(m){
+    const mm=+m[1],dd=+m[2],yy=+m[3];
+    const yyyy=yy<70?2000+yy:1900+yy;
+    return `${yyyy}-${String(mm).padStart(2,'0')}-${String(dd).padStart(2,'0')}`;
+  }
 
   return s;
 };
@@ -73,7 +85,7 @@ const numVal=v=>{
   if(v==null||v==='')return 0;
   if(typeof v==='number')return Number.isFinite(v)?v:0;
   let s=clean(v).replace(/[$\s]/g,'');
-
+  // Soporta 4.5, 4,5, 1.234,56 y 1,234.56
   if(s.includes(',')&&s.includes('.')){
     if(s.lastIndexOf(',')>s.lastIndexOf('.')) s=s.replace(/\./g,'').replace(',','.');
     else s=s.replace(/,/g,'');
@@ -90,7 +102,13 @@ const workingDays=(a,b)=>{
 };
 const isProductive=r=>{const type=clean(r['Tipo de actividad']).toLowerCase(),project=clean(r.Proyecto).toLowerCase();return !!clean(r.Actividad)&&actualHours(r)>0&&!['administrativo','almuerzo','reunión','reunion'].includes(type)&&project!=='almuerzo'};
 function App(){
- const [business,setBusiness]=useState(initial.business);const [activities,setActivities]=useState(initial.activities);const [tab,setTab]=useState('Resumen');const [notice,setNotice]=useState('');
+ const [business,setBusiness]=useState(()=>{try{return JSON.parse(localStorage.getItem('coreip_business_cache'))||initial.business}catch{return initial.business}});const [activities,setActivities]=useState(()=>{try{return JSON.parse(localStorage.getItem('coreip_activities_cache'))||initial.activities}catch{return initial.activities}});const [tab,setTab]=useState('Resumen');const [notice,setNotice]=useState('');const [sourceInfo,setSourceInfo]=useState(()=>{try{return JSON.parse(localStorage.getItem('coreip_source_info'))||{}}catch{return {}}});
+ const GDRIVE_SEGUIMIENTO_URL=import.meta.env.VITE_GDRIVE_SEGUIMIENTO_URL||'';
+ const GDRIVE_BITACORA_URL=import.meta.env.VITE_GDRIVE_BITACORA_URL||'';
+ const GDRIVE_API_KEY=import.meta.env.VITE_GDRIVE_API_KEY||'';
+ const [gDriveUrl,setGDriveUrl]=useState(()=>localStorage.getItem('coreip_gdrive_url')||GDRIVE_SEGUIMIENTO_URL);
+ const [gDriveKey,setGDriveKey]=useState(()=>localStorage.getItem('coreip_gdrive_key')||GDRIVE_API_KEY);
+ const [gDriveUrlBitacora,setGDriveUrlBitacora]=useState(()=>localStorage.getItem('coreip_gdrive_url_bitacora')||GDRIVE_BITACORA_URL);
  const [filters,setFilters]=useState({q:'',client:'Todos',area:'Todos',person:'Todos',status:'Todos',start:'',end:''});
  const sheets=Object.keys(business);
  const activityDates=useMemo(()=>activities.map(r=>normDate(r.Fecha)).filter(Boolean).sort(),[activities]);
@@ -112,40 +130,149 @@ function App(){
  const personData=useMemo(()=>population.map(p=>{const rs=filteredActivities.filter(r=>clean(r.Colaborador)===p);return {name:p,productive:rs.filter(isProductive).reduce((a,r)=>a+actualHours(r),0),estimated:rs.reduce((a,r)=>a+numVal(r['Horas Estimadas']),0),capacity:capPer}}),[population,filteredActivities,capPer]);
  const statusData=useMemo(()=>{const m={};filteredActivities.forEach(r=>m[clean(r.Estado)||'Sin estado']=(m[clean(r.Estado)||'Sin estado']||0)+1);return Object.entries(m).map(([name,value])=>({name,value}))},[filteredActivities]);
  const trendData=useMemo(()=>{const m={};filteredActivities.forEach(r=>{const d=normDate(r.Fecha);if(d)m[d]=(m[d]||0)+actualHours(r)});return Object.entries(m).sort().map(([date,value])=>({date:date.slice(5),hours:Number(value.toFixed(1))}))},[filteredActivities]);
+ async function parseWorkbook(file,type){
+   const wb=XLSX.read(await file.arrayBuffer(),{cellDates:true,raw:false});
+   if(type==='activities'){
+     const preferred=['Base_Actividades','Seguimiento','Seguimiento Diario','Base'];
+     const candidates=wb.SheetNames.map(name=>({name,rows:XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:null,raw:false})}));
+     let found=null;
+     for(const c of candidates){
+       const max=Math.min(c.rows.length,20);
+       for(let i=0;i<max;i++){
+         const keys=(c.rows[i]||[]).map(normalizeKey);
+         if(keys.some(k=>k==='fecha'||k==='dia') && keys.some(k=>k==='actividad'||k==='tarea'||k==='descripcion')){found={name:c.name,header:i};break;}
+       }
+       if(found)break;
+     }
+     if(!found){
+       const name=preferred.find(n=>wb.SheetNames.includes(n));
+       if(name)found={name,header:0};
+     }
+     if(!found)throw new Error('No se encontró una hoja de seguimiento con Fecha y Actividad');
+     const arr=XLSX.utils.sheet_to_json(wb.Sheets[found.name],{defval:null,raw:false,range:found.header})
+       .map(canonicalizeRow).filter(r=>Object.values(r).some(v=>clean(v)));
+     if(!arr.length)throw new Error('El Excel de seguimiento no contiene registros');
+     return {data:arr,meta:{file:type==='activities'?'Seguimiento KPI':'Bitácora comercial',name:type==='activities'?'Seguimiento KPI':'Bitácora comercial',sheet:found.name,rows:arr.length,updatedAt:new Date().toISOString()}};
+   }
+   if(!wb.SheetNames.includes('CONSOLIDADO'))throw new Error('El archivo de Bitácora debe contener la hoja CONSOLIDADO');
+   function readSheetAsRows(sheetName,detectHeader){
+     if(!wb.SheetNames.includes(sheetName))return null;
+     const raw=XLSX.utils.sheet_to_json(wb.Sheets[sheetName],{header:1,defval:null,raw:false});
+     let header=0;
+     if(detectHeader){
+       const idx=raw.slice(0,20).findIndex(r=>{const keys=(r||[]).map(normalizeKey);return detectHeader(keys)});
+       if(idx>=0)header=idx;
+     }
+     const body=raw.slice(header+1).filter(r=>(r||[]).some(v=>clean(v)));
+     if(!body.length)return null;
+     return [raw[header]||[],...body];
+   }
+   const consolidado=readSheetAsRows('CONSOLIDADO',keys=>keys.includes('cliente')&&keys.includes('nombredelproyecto')&&keys.includes('pccentrocostos')||keys.includes('client')&&keys.includes('nombredelproyecto'));
+   if(!consolidado)throw new Error('La hoja CONSOLIDADO no contiene registros');
+   const out={CONSOLIDADO:consolidado};
+   const servicios=readSheetAsRows('SERVICIOS');if(servicios)out.SERVICIOS=servicios;
+   const bolsa=readSheetAsRows('BOLSA DE HORAS');if(bolsa)out['BOLSA DE HORAS']=bolsa;
+   const mesa=readSheetAsRows('MESA DE AYUDA');if(mesa)out['MESA DE AYUDA']=mesa;
+   const sheetsFound=Object.keys(out).join(', ');
+   return {data:out,meta:{file:'Bitácora comercial',name:'Bitácora comercial',sheet:sheetsFound,rows:consolidado.length-1,updatedAt:new Date().toISOString()}};
+ }
  async function importExcel(file,type){
    if(!file)return;
    try{
-     const wb=XLSX.read(await file.arrayBuffer(),{cellDates:true,raw:false});
+     const parsed=await parseWorkbook(file,type);
      if(type==='activities'){
-       const preferred=['Base_Actividades','Seguimiento','Seguimiento Diario','Base'];
-       const sheet=preferred.find(n=>wb.SheetNames.includes(n))||wb.SheetNames.find(n=>{
-         const rows=XLSX.utils.sheet_to_json(wb.Sheets[n],{defval:null,raw:false});
-         const keys=Object.keys(rows[0]||{}).map(normalizeKey);
-         return keys.some(k=>k==='actividad'||k==='tarea') && keys.some(k=>k==='fecha');
-       });
-       if(!sheet)throw new Error('No se encontró una hoja de seguimiento con Fecha y Actividad');
-       const arr=XLSX.utils.sheet_to_json(wb.Sheets[sheet],{defval:null,raw:false})
-         .map(canonicalizeRow).filter(r=>Object.values(r).some(v=>clean(v)));
-       if(!arr.length)throw new Error('El Excel no contiene registros');
-       setActivities(arr);
-       setNotice(`Seguimiento KPI cargado: ${file.name} · ${arr.length} registros · ${sheet}`);
+       setActivities(parsed.data);localStorage.setItem('coreip_activities_cache',JSON.stringify(parsed.data));
+       setSourceInfo(x=>{const n={...x,activities:{...parsed.meta,fileName:file.name,mode:'archivo local'}};localStorage.setItem('coreip_source_info',JSON.stringify(n));return n});
+       setNotice(`Seguimiento KPI cargado: ${file.name} · ${parsed.data.length} registros`);
      }else{
-       const sheet=wb.SheetNames.includes('CONSOLIDADO')?'CONSOLIDADO':wb.SheetNames[0];
-       const rows=XLSX.utils.sheet_to_json(wb.Sheets[sheet],{defval:null,raw:false});
-       const out={}; out[sheet]=rows;
-       setBusiness(out);
-       setNotice(`Bitácora comercial cargada: ${file.name} · ${rows.length} registros`);
+       setBusiness(prev=>{const merged={...prev,...parsed.data};localStorage.setItem('coreip_business_cache',JSON.stringify(merged));return merged});
+       setSourceInfo(x=>{const n={...x,business:{...parsed.meta,fileName:file.name,mode:'archivo local'}};localStorage.setItem('coreip_source_info',JSON.stringify(n));return n});
+       setNotice(`Bitácora comercial cargada: ${file.name} · hojas: ${parsed.meta.sheet}`);
      }
      setTimeout(()=>setNotice(''),4500);
-   }catch(e){setNotice(`No se pudo calcular el Excel: ${e.message||'formato no reconocido'}`)}
+   }catch(e){setNotice(`No se pudo cargar el Excel: ${e.message||'formato no reconocido'}`)}
  }
+ function extractGDriveFileId(url){
+   if(!url)return '';
+   const u=url.trim();
+   if(/^[a-zA-Z0-9_-]{15,}$/.test(u))return u;
+   const patterns=[/\/d\/([a-zA-Z0-9_-]{15,})/,/[?&]id=([a-zA-Z0-9_-]{15,})/];
+   for(const p of patterns){const m=u.match(p);if(m)return m[1];}
+   return '';
+ }
+ function gDriveDownloadUrl(url,key){
+   const id=extractGDriveFileId(url);
+   if(!id||!key)return '';
+   return `https://www.googleapis.com/drive/v3/files/${id}?alt=media&key=${encodeURIComponent(key)}`;
+ }
+ async function importGDrive(url,key,type,showNotice=true){
+   if(!url)return false;
+   if(!key){if(showNotice)setNotice('Falta la clave API de Google Drive.');return false;}
+   const downloadUrl=gDriveDownloadUrl(url,key);
+   if(!downloadUrl){if(showNotice)setNotice('No se pudo interpretar el enlace de Google Drive.');return false;}
+   try{
+     const response=await fetch(downloadUrl,{cache:'no-store'});
+     if(!response.ok){
+       if(response.status===403)throw new Error('403 · revisa que el archivo sea "Cualquier persona con el enlace" y que la clave tenga la API de Drive habilitada');
+       if(response.status===404)throw new Error('404 · el archivo no existe o el enlace no es correcto');
+       throw new Error(`Google Drive respondió ${response.status}`);
+     }
+     const blob=await response.blob();
+     const name=type==='activities'?'Seguimiento Diario - Google Drive.xlsx':'Formato Bitácora 2026 - Google Drive.xlsx';
+     const file=new File([blob],name,{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+     const parsed=await parseWorkbook(file,type);
+     if(type==='activities'){
+       setActivities(parsed.data);localStorage.setItem('coreip_activities_cache',JSON.stringify(parsed.data));
+       const meta={...parsed.meta,fileName:name,mode:'Google Drive',updatedAt:new Date().toISOString()};
+       setSourceInfo(x=>{const n={...x,activities:meta};localStorage.setItem('coreip_source_info',JSON.stringify(n));return n});
+     }else{
+       setBusiness(prev=>{const merged={...prev,...parsed.data};localStorage.setItem('coreip_business_cache',JSON.stringify(merged));return merged});
+       const meta={...parsed.meta,fileName:name,mode:'Google Drive',updatedAt:new Date().toISOString()};
+       setSourceInfo(x=>{const n={...x,business:meta};localStorage.setItem('coreip_source_info',JSON.stringify(n));return n});
+     }
+     if(showNotice){setNotice(`Datos actualizados desde Google Drive · ${new Date().toLocaleString('es-CO')}`);setTimeout(()=>setNotice(''),4500)}
+     return true;
+   }catch(e){if(showNotice)setNotice(`No se pudo actualizar desde Google Drive: ${e.message||'verifica el enlace y la clave'}`);return false;}
+ }
+ useEffect(()=>{
+   const seguimientoUrl=gDriveUrl||GDRIVE_SEGUIMIENTO_URL;
+   const bitacoraUrl=gDriveUrlBitacora||GDRIVE_BITACORA_URL;
+   const key=gDriveKey||GDRIVE_API_KEY;
+   if(seguimientoUrl&&key)importGDrive(seguimientoUrl,key,'activities',false);
+   if(bitacoraUrl&&key)importGDrive(bitacoraUrl,key,'business',false);
+ },[]);
+ const saveGDrive=()=>{
+   const u=gDriveUrl.trim(),k=gDriveKey.trim();
+   localStorage.setItem('coreip_gdrive_url',u);localStorage.setItem('coreip_gdrive_key',k);
+   setNotice(u&&k?'Enlace y clave de Google Drive guardados. Se intentará actualizar automáticamente al entrar.':'Configuración de Google Drive actualizada.');
+   if(u&&k)importGDrive(u,k,'activities',true);
+   setTimeout(()=>setNotice(''),4500);
+ };
+ const refreshGDrive=()=>{
+   const u=gDriveUrl||GDRIVE_SEGUIMIENTO_URL,k=gDriveKey||GDRIVE_API_KEY;
+   if(u&&k)importGDrive(u,k,'activities',true);
+   else setNotice('Primero configura el enlace y la clave API de Google Drive.');
+ };
+ const saveGDriveBitacora=()=>{
+   const u=gDriveUrlBitacora.trim(),k=gDriveKey.trim();
+   localStorage.setItem('coreip_gdrive_url_bitacora',u);
+   setNotice(u&&k?'Enlace de Bitácora guardado. Se intentará actualizar automáticamente al entrar.':u&&!k?'Falta la clave API de Google Drive (arriba, en Seguimiento).':'Configuración de Bitácora actualizada.');
+   if(u&&k)importGDrive(u,k,'business',true);
+   setTimeout(()=>setNotice(''),4500);
+ };
+ const refreshGDriveBitacora=()=>{
+   const u=gDriveUrlBitacora||GDRIVE_BITACORA_URL,k=gDriveKey||GDRIVE_API_KEY;
+   if(u&&k)importGDrive(u,k,'business',true);
+   else setNotice('Primero configura el enlace de Bitácora y la clave API de Google Drive.');
+ };
+
  const nav=[['Resumen',LayoutDashboard],['KPIs Ingeniería',Target],['Proyectos',FolderKanban],['Servicios',Server],['Bolsa de horas',Clock3],['Mesa de ayuda',LifeBuoy],['Bitácora',Activity]];
  return <div className="app"><aside><div className="brand"><div className="logo">C</div><div><b>CORE IP</b><span>Centro de control</span></div></div><nav>{nav.map(([n,I])=><button key={n} className={tab===n?'active':''} onClick={()=>setTab(n)}><I size={17}/>{n}</button>)}</nav><div className="source"><Database size={17}/><div><b>Fuentes conectadas</b><span>{sheets.length} hojas comerciales · {activities.length} actividades</span></div></div></aside>
- <main><header><div><p className="eyebrow">CENTRO DE OPERACIONES · CORE IP</p><h1>{tab}</h1><p className="sub">Una sola vista para operación, proyectos, clientes, servicios y desempeño de ingeniería.</p></div><div className="uploads"><label className="upload"><Upload size={16}/> Bitácora comercial<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'business')}/></label><label className="upload secondary"><Upload size={16}/> Seguimiento KPI<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'activities')}/></label></div></header>{notice&&<div className="toast"><CheckCircle2 size={17}/>{notice}</div>}
+ <main><header><div><p className="eyebrow">CENTRO DE OPERACIONES · CORE IP</p><h1>{tab}</h1><p className="sub">Una sola vista para operación, proyectos, clientes, servicios y desempeño de ingeniería.</p></div><div className="uploads"><label className="upload"><Upload size={16}/> Bitácora comercial<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'business')}/></label><label className="upload secondary"><Upload size={16}/> Seguimiento KPI<input type="file" accept=".xlsx,.xls" onChange={e=>importExcel(e.target.files?.[0],'activities')}/></label><button className="ghost" onClick={refreshGDrive}><RefreshCw size={15}/> Actualizar Google Drive</button></div></header>{notice&&<div className="toast"><CheckCircle2 size={17}/>{notice}</div>}<section className="sourceBar"><div><b>Seguimiento desde Google Drive</b><span>{sourceInfo.activities?.mode==='Google Drive'?'Última sincronización: '+new Date(sourceInfo.activities.updatedAt).toLocaleString('es-CO'):'Pega el enlace compartido y la clave API de Google Drive; el mismo archivo actualizado será usado al volver a entrar.'}</span></div><div className="sourceControls"><input value={gDriveUrl} onChange={e=>setGDriveUrl(e.target.value)} placeholder="Pega aquí el enlace compartido de Google Drive"/><input value={gDriveKey} onChange={e=>setGDriveKey(e.target.value)} type="password" placeholder="Clave API de Google Drive"/><button className="ghost" onClick={saveGDrive}>Guardar fuente</button></div></section><section className="sourceBar"><div><b>Bitácora comercial desde Google Drive</b><span>{sourceInfo.business?.mode==='Google Drive'?'Última sincronización: '+new Date(sourceInfo.business.updatedAt).toLocaleString('es-CO'):'Usa la misma clave API de arriba; pega aquí el enlace del archivo de Bitácora (CONSOLIDADO).'}</span></div><div className="sourceControls"><input value={gDriveUrlBitacora} onChange={e=>setGDriveUrlBitacora(e.target.value)} placeholder="Pega aquí el enlace de la Bitácora comercial"/><button className="ghost" onClick={saveGDriveBitacora}>Guardar fuente</button><button className="ghost" onClick={refreshGDriveBitacora}><RefreshCw size={15}/> Actualizar</button></div></section>
  {tab==='Resumen'&&<Executive totals={totals} kpi={engKpis} clients={clientRows} serviceRows={serviceRows} personData={personData} statusData={statusData} trendData={trendData} setTab={setTab}/>} 
  {tab==='KPIs Ingeniería'&&<KPIDashboard kpi={engKpis} personData={personData} statusData={statusData} trendData={trendData} filters={filters} setFilters={setFilters} start={start} end={end} population={population} activities={activities}/>} 
  {tab==='Proyectos'&&<Projects rows={projectRows} clients={uniq(projectRows.map(x=>x.cliente))} filters={filters} setFilters={setFilters}/>} 
- {tab==='Servicios'&&<Services data={serviceRows}/>} {tab==='Bolsa de horas'&&<Bolsa data={bolsaRows}/>} {tab==='Mesa de ayuda'&&<Help data={helpRows}/>} {tab==='Bitácora'&&<Bitacora rows={filteredActivities} filters={filters} setFilters={setFilters} start={start} end={end} population={population}/>} 
+ {tab==='Clientes'&&<Clients data={clientRows}/>} {tab==='Servicios'&&<Services data={serviceRows}/>} {tab==='Bolsa de horas'&&<Bolsa data={bolsaRows}/>} {tab==='Mesa de ayuda'&&<Help data={helpRows}/>} {tab==='Bitácora'&&<Bitacora rows={filteredActivities} filters={filters} setFilters={setFilters} start={start} end={end} population={population}/>} 
  </main></div>
 }
 function KPI({icon:I,label,value,detail,tone='blue'}){return <div className="kpi"><div className="kpiTop"><span>{label}</span><span className={'ico '+tone}><I size={17}/></span></div><strong>{value}</strong><small>{detail}</small></div>}
@@ -156,6 +283,7 @@ function Alert({icon:I,title,text,tone}){return <div className={'alert '+tone}><
 function Panel({title,subtitle,children}){return <div className="panel"><div className="panelHead"><div><h2>{title}</h2><p>{subtitle}</p></div></div>{children}</div>}
 function KPIDashboard({kpi,personData,statusData,trendData,filters,setFilters,start,end,population,activities}){return <><Filters filters={filters} setFilters={setFilters} activities={activities}/><section className="infoBanner"><CalendarDays size={19}/><div><b>Capacidad real del periodo</b><span>{start||'N/D'} → {end||'N/D'} · {workingDays(start,end)} días laborables · 7 h/persona/día · {population.length} colaboradores</span></div><strong>{num(kpi.capacity)} h</strong></section><section className="grid kpis six"><KPI icon={Activity} label="Actividades" value={kpi.total} detail={`${num(kpi.actual)} h registradas`}/><KPI icon={Timer} label="Horas productivas" value={`${num(kpi.productive)} h`} detail="Excluye almuerzo/administrativo" tone="cyan"/><KPI icon={BriefcaseBusiness} label="Carga estimada" value={pct(kpi.load)} detail={`${num(kpi.estimated)} h estimadas`} tone={kpi.load>100?'red':kpi.load>=80?'orange':'blue'}/><KPI icon={Target} label="Utilización" value={pct(kpi.utilization)} detail={`${num(kpi.productive)} / ${num(kpi.capacity)} h`} tone={kpi.utilization>=80?'green':'cyan'}/><KPI icon={CheckCircle2} label="Finalización" value={pct(kpi.completion)} detail="Actividades finalizadas" tone="green"/><KPI icon={TrendingUp} label="Avance promedio" value={pct(kpi.avgAdvance)} detail="% Avance registrado" tone="purple"/></section><section className="chartGrid"><Panel title="Capacidad por colaborador" subtitle="Asignado vs capacidad"><ResponsiveContainer width="100%" height={300}><BarChart data={personData}><CartesianGrid strokeDasharray="3 3" vertical={false}/><XAxis dataKey="name" tick={{fontSize:9}}/><YAxis/><Tooltip/><Legend/><Bar dataKey="capacity" name="Capacidad" fill="#cbd5e1"/><Bar dataKey="estimated" name="Estimado" fill="#7c3aed" radius={[5,5,0,0]}/></BarChart></ResponsiveContainer></Panel><Panel title="Horas productivas" subtitle="Por colaborador"><ResponsiveContainer width="100%" height={300}><BarChart data={personData}><XAxis dataKey="name" tick={{fontSize:9}}/><YAxis/><Tooltip/><Bar dataKey="productive" fill="#0891b2" radius={[5,5,0,0]}/></BarChart></ResponsiveContainer></Panel><Panel title="Tendencia diaria" subtitle="Horas registradas"><ResponsiveContainer width="100%" height={300}><LineChart data={trendData}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date"/><YAxis/><Tooltip/><Line type="monotone" dataKey="hours" stroke="#2563eb" strokeWidth={3}/></LineChart></ResponsiveContainer></Panel></section><Panel title="Semáforo de capacidad" subtitle="Más de 100% = sobrecarga · 80–100% = atención · menos de 80% = normal"><div className="capacityGrid">{personData.map(x=>{const load=x.capacity?x.estimated/x.capacity*100:0;return <div className="capacityCard" key={x.name}><b>{x.name}</b><div><span>Capacidad</span><strong>{num(x.capacity)} h</strong></div><div><span>Asignado</span><strong>{num(x.estimated)} h</strong></div><div><span>Disponible</span><strong>{num(Math.max(x.capacity-x.estimated,0))} h</strong></div><div className="loadBar"><span className={load>100?'over':''} style={{width:`${Math.min(load,130)/1.3}%`}}/></div><small>{pct(load)} de carga</small></div>})}</div></Panel></>}
 function Projects({rows,clients,filters,setFilters}){return <><div className="toolbar"><div className="search"><Search size={17}/><input placeholder="Buscar proyecto, cliente, observación..." value={filters.q} onChange={e=>setFilters(f=>({...f,q:e.target.value}))}/></div><select value={filters.client} onChange={e=>setFilters(f=>({...f,client:e.target.value}))}><option>Todos</option>{clients.map(c=><option key={c}>{c}</option>)}</select><button className="ghost" onClick={()=>setFilters(f=>({...f,q:'',client:'Todos'}))}><RefreshCw size={15}/> Limpiar</button></div><Table title={`${rows.length} proyectos`} subtitle="Consolidado financiero y operativo." heads={['Cliente','Proyecto','Valor','Facturado','Avance','Observación']} rows={rows.map(x=><><td><b>{x.cliente}</b></td><td>{x.proyecto}</td><td>{money(x.valor)}</td><td>{money(x.facturado)}</td><td><Progress v={x.avance}/></td><td>{x.obs||'—'}</td></>)}/></>}
+function Clients({data}){return <Table title="Clientes" subtitle="Ranking por valor contratado." heads={['Cliente','Proyectos','Valor','Facturado','Avance facturación']} rows={data.map(x=><><td><b>{x.name}</b></td><td>{x.projects}</td><td>{money(x.value)}</td><td>{money(x.billed)}</td><td><Progress v={x.value?x.billed/x.value*100:0}/></td></>)}/>} 
 function Services({data}){return <Table title="Servicios" subtitle="Portafolio, facturación y renovaciones." heads={['Entidad','Producto','Disponibilidad','Mensual','Ciclo','Duración','Renovación']} rows={data.map(x=><><td><b>{x.entity}</b></td><td>{x.product}</td><td>{x.availability||'—'}</td><td>{money(x.monthly)}</td><td>{x.cycle||'—'}</td><td>{x.duration||'—'}</td><td>{x.renew||'—'}</td></>)}/>} 
 function Bolsa({data}){return <Table title="Bolsa de horas" subtitle="Consumo y saldo por cliente." heads={['Cliente','Servicio','Contratadas','Utilizadas','Restantes','Estado']} rows={data.map(x=><><td><b>{x.client}</b></td><td>{x.services}</td><td>{num(x.contracted)} h</td><td>{num(x.used)} h</td><td><span className={'tag '+(x.remaining<=2?'warn':'ok')}>{num(x.remaining)} h</span></td><td>{x.status||'—'}</td></>)}/>} 
 function Help({data}){return <Table title="Mesa de ayuda" subtitle="Contratos y cobertura de soporte." heads={['Cliente','Contrato','Servicios','Inicio','Fin','Estado']} rows={data.map(x=><><td><b>{x.client}</b></td><td>{x.type||'—'}</td><td>{x.services||'—'}</td><td>{x.start||'—'}</td><td>{x.end||'—'}</td><td><span className="tag ok">{x.status||'Sin estado'}</span></td></>)}/>} 
